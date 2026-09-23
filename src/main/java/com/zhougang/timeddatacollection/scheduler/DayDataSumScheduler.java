@@ -3,9 +3,12 @@ package com.zhougang.timeddatacollection.scheduler;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.zhougang.timeddatacollection.service.CokeMaterialQueryService;
 import com.zhougang.timeddatacollection.service.FilterMaterialQueryService;
+import com.zhougang.timeddatacollection.service.IronCokeQueryService;
 import com.zhougang.timeddatacollection.service.JmStorageService;
+import com.zhougang.timeddatacollection.service.SinteredCokeQueryService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -17,43 +20,68 @@ import java.util.Map;
 /**
  * 日度数据合计定时任务
  * <p>
- * 每天0点5分0秒运行，汇总前一天的材料数据之和：
+ * 每天0点5分0秒运行，回采昨天以及过去一年（共 collectDays 天）的材料数据之和：
  * 焦炭 = 筛选材料查询（materialType=1）netWgt 合计 + 焦炭材料查询 transportWeight 合计；
- * 喷煤 = 筛选材料查询（materialType=2）按"高挥发"/"低硫"分别汇总，存储为"烟煤"/"无烟煤"。
- * 结果分别以 type=焦炭 / 烟煤 / 无烟煤 写入 jm_day 表
+ * 喷煤 = 筛选材料查询（materialType=2）按"高挥发"/"低硫"分别汇总，存储为"烟煤"/"无烟煤"；
+ * 烧结焦炭 = 焦炭材料流转查询（endPos=ST1_LC_RP）transportWeight 合计；
+ * 炼铁焦炭 = 焦炭材料流转查询（两组 matCodeList 各查一次）transportWeight 合计之和。
+ * 结果分别以 type=焦炭 / 烟煤 / 无烟煤 / 烧结焦炭 / 炼铁焦炭 写入 jm_day 表，已存在的数据会被覆盖
  */
 @Component
 public class DayDataSumScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(DayDataSumScheduler.class);
 
+    /** 回采天数：昨天 + 往前共几天，默认 365 */
+    @Value("${timedata.collect.days:365}")
+    private int collectDays;
+
     private final FilterMaterialQueryService filterMaterialQueryService;
     private final CokeMaterialQueryService cokeMaterialQueryService;
+    private final SinteredCokeQueryService sinteredCokeQueryService;
+    private final IronCokeQueryService ironCokeQueryService;
     private final JmStorageService jmStorageService;
+    private final CollectRateLimiter rateLimiter;
 
     public DayDataSumScheduler(FilterMaterialQueryService filterMaterialQueryService,
                                CokeMaterialQueryService cokeMaterialQueryService,
-                               JmStorageService jmStorageService) {
+                               SinteredCokeQueryService sinteredCokeQueryService,
+                               IronCokeQueryService ironCokeQueryService,
+                               JmStorageService jmStorageService,
+                               CollectRateLimiter rateLimiter) {
         this.filterMaterialQueryService = filterMaterialQueryService;
         this.cokeMaterialQueryService = cokeMaterialQueryService;
+        this.sinteredCokeQueryService = sinteredCokeQueryService;
+        this.ironCokeQueryService = ironCokeQueryService;
         this.jmStorageService = jmStorageService;
+        this.rateLimiter = rateLimiter;
     }
 
     /**
-     * 每天0点5分0秒运行：采集前一天的材料数据之和
+     * 每天0点5分0秒运行：回采昨天以及过去一年的材料数据之和（共 collectDays 天）
+     * <p>
+     * 逐日采集，已存在的数据会被覆盖；每天之间加入延迟，避免触发上游限速。
      */
     @Scheduled(cron = "0 5 0 * * ?")
     public void scheduledCollectDaySum() {
-        log.info("========== 日度数据合计采集触发 ==========");
-        try {
-            ZoneId zone = ZoneId.systemDefault();
-            LocalDate yesterday = LocalDate.now().minusDays(1);
-            long dayStartTime = yesterday.atStartOfDay(zone).toInstant().toEpochMilli();
-            collectDaySum(dayStartTime);
-            log.info("========== 日度数据合计采集完成 ==========");
-        } catch (Exception e) {
-            log.error("日度数据合计采集失败: {}", e.getMessage(), e);
+        ZoneId zone = ZoneId.systemDefault();
+        LocalDate today = LocalDate.now();
+        log.info("========== 日度数据合计回采开始: 昨天起往前共 {} 天 ==========", collectDays);
+
+        for (int i = 1; i <= collectDays; i++) {
+            LocalDate date = today.minusDays(i);
+            long dayStartTime = date.atStartOfDay(zone).toInstant().toEpochMilli();
+            log.info("{}", dayStartTime);
+            try {
+                collectDaySum(dayStartTime);
+            } catch (Exception e) {
+                // 单日失败不中断整体回采
+                log.error("日度数据合计采集失败, date={}: {}", date, e.getMessage(), e);
+            }
+            rateLimiter.pause();
         }
+
+        log.info("========== 日度数据合计回采结束: 共处理 {} 天 ==========", collectDays);
     }
 
     /**
@@ -84,7 +112,16 @@ public class DayDataSumScheduler {
             jmStorageService.storeDay(entry.getKey(), entry.getValue(), startTime);
         }
 
-        log.info("日度采集完成: 焦炭总和={}, 喷煤明细={}", cokeTotal, pciFilterMap);
+        // 烧结焦炭：焦炭材料流转查询（endPos=ST1_LC_RP）
+        double sinteredCoke = sinteredCokeQueryService.queryTotalWeight(startTime, endTime);
+        jmStorageService.storeDay("烧结焦炭", sinteredCoke, startTime);
+
+        // 炼铁焦炭：两组 matCodeList 各查一次，结果相加
+        double ironCoke = ironCokeQueryService.queryTotalWeight(startTime, endTime);
+        jmStorageService.storeDay("炼铁焦炭", ironCoke, startTime);
+
+        log.info("日度采集完成: 焦炭总和={}, 喷煤明细={}, 烧结焦炭={}, 炼铁焦炭={}",
+                cokeTotal, pciFilterMap, sinteredCoke, ironCoke);
     }
 
 }

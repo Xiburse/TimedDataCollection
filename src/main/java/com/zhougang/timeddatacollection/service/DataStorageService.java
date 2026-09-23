@@ -10,13 +10,17 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.Map;
 
 /**
  * 数据存储服务
  * <p>
  * 所有ID的日数据存入一张 day 表，月数据存入一张 month 表。
- * 主键为 (selectTime, dataId) 组合，防止同一ID在同一时间戳下重复插入。
+ * 主键为 (selectTime, dataId) 组合；同一主键再次采集时直接覆盖原有数据。
+ * <p>
+ * 覆盖时 isOld 标记取"已有值"与"本次值"的较大者：
+ * 只要该记录曾被标记为老数据（isOld=1），后续普通采集不会把这个标记抹掉。
  */
 @Service
 public class DataStorageService {
@@ -33,7 +37,7 @@ public class DataStorageService {
     }
 
     /**
-     * 存储采集到的数据
+     * 存储采集到的数据（已存在则覆盖）
      *
      * @param selectTime 本次查询的时间戳（毫秒）
      * @param dataMap    响应中的 data 字段 Map<ID名, DataItemDTO>
@@ -53,25 +57,24 @@ public class DataStorageService {
         createTableIfNotExists(tableName);
 
         int inserted = 0;
-        int skipped = 0;
+        int updated = 0;
 
         for (Map.Entry<String, DataItemDTO> entry : dataMap.entrySet()) {
             String dataId = entry.getKey();      // 如 xcepma_01_zcpcl_00_00_24
             DataItemDTO item = entry.getValue();
 
             try {
-                if (insertIfNotExists(tableName, selectTime, dataId, item, isOld)) {
+                if (upsert(tableName, selectTime, dataId, item, isOld)) {
                     inserted++;
                 } else {
-                    skipped++;
-                    log.info("表[{}]中 selectTime={}, dataId={} 已存在，跳过插入", tableName, selectTime, dataId);
+                    updated++;
                 }
             } catch (Exception e) {
                 log.error("存储 dataId={} 失败: {}", dataId, e.getMessage(), e);
             }
         }
 
-        log.info("数据存储完成 -> 表[{}]: 插入={}, 跳过={}", tableName, inserted, skipped);
+        log.info("数据存储完成 -> 表[{}]: 插入={}, 覆盖={}", tableName, inserted, updated);
     }
 
     /**
@@ -100,21 +103,25 @@ public class DataStorageService {
     }
 
     /**
-     * 插入数据（如不存在则插入）
+     * 写入数据：不存在则插入，已存在则用新采集的值覆盖
+     * <p>
+     * 覆盖时 isOld 取"已有值"与"本次值"的较大者，保证老ID标记不会被普通采集重置为 0。
      *
      * @param isOld 是否为老数据（0=否，1=是）
-     * @return true=插入了新数据, false=已存在跳过
+     * @return true=新插入, false=覆盖已有记录
      */
-    private boolean insertIfNotExists(String tableName, long selectTime, String dataId, DataItemDTO item, int isOld) {
+    private boolean upsert(String tableName, long selectTime, String dataId, DataItemDTO item, int isOld) {
         String q = quoteChar;
 
-        // 检查该 (selectTime, dataId) 组合是否已存在
-        String checkSql = "SELECT COUNT(*) FROM " + q + tableName + q
+        // 查询该 (selectTime, dataId) 是否已存在，并取出已有的 isOld 标记
+        String checkSql = "SELECT " + q + "isOld" + q + " FROM " + q + tableName + q
                 + " WHERE " + q + "selectTime" + q + " = ? AND " + q + "dataId" + q + " = ?";
-        Integer count = jdbcTemplate.queryForObject(checkSql, Integer.class, selectTime, dataId);
+        List<Integer> existingIsOldList = jdbcTemplate.queryForList(checkSql, Integer.class, selectTime, dataId);
 
-        if (count != null && count > 0) {
-            return false;
+        // 老ID标记只增不减：已有 isOld=1 的记录，不会被本次 isOld=0 的采集抹掉
+        int finalIsOld = isOld;
+        if (!existingIsOldList.isEmpty() && existingIsOldList.get(0) != null) {
+            finalIsOld = Math.max(existingIsOldList.get(0), isOld);
         }
 
         // 计算可读时间
@@ -123,26 +130,58 @@ public class DataStorageService {
                 .toLocalDateTime()
                 .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
 
-        // 插入
-        String insertSql = "INSERT INTO " + q + tableName + q + " ("
-                + q + "selectTime" + q + ","
-                + q + "readableTime" + q + ","
-                + q + "dataId" + q + ","
-                + q + "id" + q + ","
-                + q + "valueBigDecimal" + q + ","
-                + q + "value" + q + ","
-                + q + "valueTime" + q + ","
-                + q + "valueTimeDate" + q + ","
-                + q + "valueUpdateTime" + q + ","
-                + q + "dataQuality" + q + ","
-                + q + "timeDivision" + q + ","
-                + q + "isOld" + q
-                + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
+        if (existingIsOldList.isEmpty()) {
+            // 不存在 -> 插入
+            String insertSql = "INSERT INTO " + q + tableName + q + " ("
+                    + q + "selectTime" + q + ","
+                    + q + "readableTime" + q + ","
+                    + q + "dataId" + q + ","
+                    + q + "id" + q + ","
+                    + q + "valueBigDecimal" + q + ","
+                    + q + "value" + q + ","
+                    + q + "valueTime" + q + ","
+                    + q + "valueTimeDate" + q + ","
+                    + q + "valueUpdateTime" + q + ","
+                    + q + "dataQuality" + q + ","
+                    + q + "timeDivision" + q + ","
+                    + q + "isOld" + q
+                    + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
 
-        jdbcTemplate.update(insertSql,
-                selectTime,
+            jdbcTemplate.update(insertSql,
+                    selectTime,
+                    readableTime,
+                    dataId,
+                    item.getId(),
+                    item.getValueBigDecimal(),
+                    item.getValue(),
+                    item.getValueTime(),
+                    item.getValueTimeDate(),
+                    item.getValueUpdateTime(),
+                    item.getDataQuality(),
+                    item.getTimeDivision(),
+                    finalIsOld
+            );
+
+            log.debug("表[{}]插入成功, selectTime={}, dataId={}, isOld={}", tableName, selectTime, dataId, finalIsOld);
+            return true;
+        }
+
+        // 已存在 -> 覆盖全部数据字段
+        String updateSql = "UPDATE " + q + tableName + q + " SET "
+                + q + "readableTime" + q + " = ?,"
+                + q + "id" + q + " = ?,"
+                + q + "valueBigDecimal" + q + " = ?,"
+                + q + "value" + q + " = ?,"
+                + q + "valueTime" + q + " = ?,"
+                + q + "valueTimeDate" + q + " = ?,"
+                + q + "valueUpdateTime" + q + " = ?,"
+                + q + "dataQuality" + q + " = ?,"
+                + q + "timeDivision" + q + " = ?,"
+                + q + "isOld" + q + " = ? "
+                + "WHERE " + q + "selectTime" + q + " = ? AND " + q + "dataId" + q + " = ?";
+
+        jdbcTemplate.update(updateSql,
                 readableTime,
-                dataId,
                 item.getId(),
                 item.getValueBigDecimal(),
                 item.getValue(),
@@ -151,11 +190,13 @@ public class DataStorageService {
                 item.getValueUpdateTime(),
                 item.getDataQuality(),
                 item.getTimeDivision(),
-                isOld
+                finalIsOld,
+                selectTime,
+                dataId
         );
 
-        log.debug("表[{}]插入成功, selectTime={}, dataId={}, isOld={}", tableName, selectTime, dataId, isOld);
-        return true;
+        log.debug("表[{}]覆盖成功, selectTime={}, dataId={}, isOld={}", tableName, selectTime, dataId, finalIsOld);
+        return false;
     }
 
 }

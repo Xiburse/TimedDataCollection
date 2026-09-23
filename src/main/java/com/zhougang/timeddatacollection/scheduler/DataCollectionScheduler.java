@@ -19,6 +19,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
+import java.time.YearMonth;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -41,16 +42,27 @@ public class DataCollectionScheduler {
     @Value("${timedata.time-division}")
     private String timeDivision;
 
+    /** 回采天数：昨天 + 往前共几天，默认 365 */
+    @Value("${timedata.collect.days:365}")
+    private int collectDays;
+
+    /** 回采月数：昨月 + 往前共几个月，默认 12 */
+    @Value("${timedata.collect.months:12}")
+    private int collectMonths;
+
     private final RestTemplate restTemplate;
     private final DataStorageService dataStorageService;
     private final ObjectMapper objectMapper;
+    private final CollectRateLimiter rateLimiter;
 
     public DataCollectionScheduler(RestTemplate restTemplate,
                                    DataStorageService dataStorageService,
-                                   ObjectMapper objectMapper) {
+                                   ObjectMapper objectMapper,
+                                   CollectRateLimiter rateLimiter) {
         this.restTemplate = restTemplate;
         this.dataStorageService = dataStorageService;
         this.objectMapper = objectMapper;
+        this.rateLimiter = rateLimiter;
     }
 
     /**
@@ -77,33 +89,54 @@ public class DataCollectionScheduler {
     }
 
     /**
-     * 每天凌晨自动执行：采集前一天的日数据
+     * 每天凌晨自动执行：采集昨天以及过去一年的日数据（共 collectDays 天）
+     * <p>
+     * 逐日采集，已存在的数据会被覆盖；每天之间加入延迟，避免触发上游限速。
      */
     @Scheduled(cron = "0 30 0 * * ?")
     public void scheduledCollect() {
-        long yesterdayZeroTimestamp = LocalDate.now()
-                .minusDays(1)
-                .atStartOfDay(ZoneId.systemDefault())
-                .toInstant()
-                .toEpochMilli();
-        collectData(yesterdayZeroTimestamp);
+        ZoneId zone = ZoneId.systemDefault();
+        LocalDate today = LocalDate.now();
+        log.info("========== 日数据回采开始: 昨天起往前共 {} 天 ==========", collectDays);
+
+        for (int i = 1; i <= collectDays; i++) {
+            LocalDate date = today.minusDays(i);
+            long timestamp = date.atStartOfDay(zone).toInstant().toEpochMilli();
+            try {
+                collectData(timestamp);
+            } catch (Exception e) {
+                // 单日失败不中断整体回采（采集失败详情由 collectData 内部记录）
+                log.error("日数据采集失败, date={}: {}", date, e.getMessage(), e);
+            }
+            rateLimiter.pause();
+        }
+
+        log.info("========== 日数据回采结束: 共处理 {} 天 ==========", collectDays);
     }
 
     /**
-     * 每月1号凌晨自动执行：采集上个月的月数据
+     * 每月1号凌晨自动执行：采集上个月以及过去一年的月数据（共 collectMonths 个月）
+     * <p>
+     * 逐月采集，已存在的数据会被覆盖；每月之间加入延迟，避免触发上游限速。
      */
     @Scheduled(cron = "0 30 0 1 * ?")
     public void scheduledMonthlyCollect() {
-        // 上个月1号0点的时间戳
-        long lastMonthFirstTimestamp = LocalDate.now()
-                .minusMonths(1)
-                .withDayOfMonth(1)
-                .atStartOfDay(ZoneId.systemDefault())
-                .toInstant()
-                .toEpochMilli();
+        ZoneId zone = ZoneId.systemDefault();
+        YearMonth thisMonth = YearMonth.now();
+        log.info("========== 月数据回采开始: 昨月起往前共 {} 个月 ==========", collectMonths);
 
-        log.info("========== 月数据采集触发, lastMonthFirst={} ==========", lastMonthFirstTimestamp);
-        doCollect(lastMonthFirstTimestamp, "time_division,0,M", "month", null, 0);
+        for (int i = 1; i <= collectMonths; i++) {
+            YearMonth month = thisMonth.minusMonths(i);
+            long timestamp = month.atDay(1).atStartOfDay(zone).toInstant().toEpochMilli();
+            try {
+                collectMonthData(timestamp);
+            } catch (Exception e) {
+                log.error("月数据采集失败, month={}: {}", month, e.getMessage(), e);
+            }
+            rateLimiter.pause();
+        }
+
+        log.info("========== 月数据回采结束: 共处理 {} 个月 ==========", collectMonths);
     }
 
     /**
