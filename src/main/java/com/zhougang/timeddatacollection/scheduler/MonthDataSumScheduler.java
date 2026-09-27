@@ -1,6 +1,7 @@
 package com.zhougang.timeddatacollection.scheduler;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.zhougang.timeddatacollection.service.BlastFurnacePciQueryService;
 import com.zhougang.timeddatacollection.service.CokeMaterialQueryService;
 import com.zhougang.timeddatacollection.service.FilterMaterialQueryService;
 import com.zhougang.timeddatacollection.service.IronCokeQueryService;
@@ -25,8 +26,11 @@ import java.util.Map;
  * 焦炭 = 筛选材料查询（materialType=1）netWgt 合计 + 焦炭材料查询 transportWeight 合计；
  * 喷煤 = 筛选材料查询（materialType=2）按"高挥发"/"低硫"分别汇总，存储为"烟煤"/"无烟煤"；
  * 烧结焦炭 = 焦炭材料流转查询（endPos=ST1_LC_RP）transportWeight 合计；
- * 炼铁焦炭 = 焦炭材料流转查询（两组 matCodeList 各查一次）transportWeight 合计之和。
- * 结果分别以 type=焦炭 / 烟煤 / 无烟煤 / 烧结焦炭 / 炼铁焦炭 写入 jm_month 表，已存在的数据会被覆盖
+ * 炼铁焦炭 = 焦炭材料流转查询（两组 matCodeList 各查一次）transportWeight 合计之和；
+ * 高炉高挥发喷煤 = 焦炭材料流转查询（终点 BF1_LC_PM1~PM5，matCode=1220000008）transportWeight 合计；
+ * 高炉低硫贫瘦喷煤 = 同一接口（matCode=1220000015）transportWeight 合计，与前者分别独立入库。
+ * 结果分别以 type=焦炭 / 烟煤 / 无烟煤 / 烧结焦炭 / 炼铁焦炭 / 高炉高挥发喷煤 / 高炉低硫贫瘦喷煤
+ * 写入 jm_month 表，已存在的数据会被覆盖
  */
 @Component
 public class MonthDataSumScheduler {
@@ -41,6 +45,7 @@ public class MonthDataSumScheduler {
     private final CokeMaterialQueryService cokeMaterialQueryService;
     private final SinteredCokeQueryService sinteredCokeQueryService;
     private final IronCokeQueryService ironCokeQueryService;
+    private final BlastFurnacePciQueryService blastFurnacePciQueryService;
     private final JmStorageService jmStorageService;
     private final CollectRateLimiter rateLimiter;
 
@@ -48,12 +53,14 @@ public class MonthDataSumScheduler {
                                  CokeMaterialQueryService cokeMaterialQueryService,
                                  SinteredCokeQueryService sinteredCokeQueryService,
                                  IronCokeQueryService ironCokeQueryService,
+                                 BlastFurnacePciQueryService blastFurnacePciQueryService,
                                  JmStorageService jmStorageService,
                                  CollectRateLimiter rateLimiter) {
         this.filterMaterialQueryService = filterMaterialQueryService;
         this.cokeMaterialQueryService = cokeMaterialQueryService;
         this.sinteredCokeQueryService = sinteredCokeQueryService;
         this.ironCokeQueryService = ironCokeQueryService;
+        this.blastFurnacePciQueryService = blastFurnacePciQueryService;
         this.jmStorageService = jmStorageService;
         this.rateLimiter = rateLimiter;
     }
@@ -103,6 +110,8 @@ public class MonthDataSumScheduler {
         double anthraciteTotal = 0;   // 无烟煤（低硫）
         double sinteredCokeTotal = 0; // 烧结焦炭
         double ironCokeTotal = 0;     // 炼铁焦炭
+        double highVolatilePciTotal = 0;   // 高炉高挥发喷煤
+        double lowSulfurLeanPciTotal = 0;  // 高炉低硫贫瘦喷煤
 
         for (int day = 1; day <= daysInMonth; day++) {
             LocalDate date = month.atDay(day);
@@ -131,23 +140,39 @@ public class MonthDataSumScheduler {
             double ironCokeDay = ironCokeQueryService.queryTotalWeight(dayStartTime, dayEndTime);
             ironCokeTotal += ironCokeDay;
 
+            // 高炉高挥发喷煤：endPos=BF1_LC_PM1~PM5，matCode=1220000008
+            double highVolatilePciDay = blastFurnacePciQueryService.queryHighVolatileWeight(dayStartTime, dayEndTime);
+            highVolatilePciTotal += highVolatilePciDay;
+
+            // 高炉低硫贫瘦喷煤：同一接口，matCode=1220000015
+            double lowSulfurLeanPciDay = blastFurnacePciQueryService.queryLowSulfurLeanWeight(dayStartTime, dayEndTime);
+            lowSulfurLeanPciTotal += lowSulfurLeanPciDay;
+
             log.info("采集完成第 {} 天 {}: 焦炭={}, 烟煤={}, 无烟煤={}, 烧结焦炭={}, 炼铁焦炭={}, "
-                            + "累计焦炭={}, 累计烟煤={}, 累计无烟煤={}, 累计烧结焦炭={}, 累计炼铁焦炭={}",
+                            + "高炉高挥发喷煤={}, 高炉低硫贫瘦喷煤={}, "
+                            + "累计焦炭={}, 累计烟煤={}, 累计无烟煤={}, 累计烧结焦炭={}, 累计炼铁焦炭={}, "
+                            + "累计高炉高挥发喷煤={}, 累计高炉低硫贫瘦喷煤={}",
                     day, date, cokeDay, bituminousDay, anthraciteDay, sinteredCokeDay, ironCokeDay,
-                    cokeTotal, bituminousTotal, anthraciteTotal, sinteredCokeTotal, ironCokeTotal);
+                    highVolatilePciDay, lowSulfurLeanPciDay,
+                    cokeTotal, bituminousTotal, anthraciteTotal, sinteredCokeTotal, ironCokeTotal,
+                    highVolatilePciTotal, lowSulfurLeanPciTotal);
 
             rateLimiter.pause();
         }
 
-        // 入库：焦炭 / 烟煤 / 无烟煤 / 烧结焦炭 / 炼铁焦炭，total=整月累加，time=当月1号0点0分0秒
+        // 入库：各 type 的 total=整月累加，time=当月1号0点0分0秒
         jmStorageService.storeMonth("焦炭", cokeTotal, monthStartTime);
         jmStorageService.storeMonth("烟煤", bituminousTotal, monthStartTime);
         jmStorageService.storeMonth("无烟煤", anthraciteTotal, monthStartTime);
         jmStorageService.storeMonth("烧结焦炭", sinteredCokeTotal, monthStartTime);
         jmStorageService.storeMonth("炼铁焦炭", ironCokeTotal, monthStartTime);
+        jmStorageService.storeMonth("高炉高挥发喷煤", highVolatilePciTotal, monthStartTime);
+        jmStorageService.storeMonth("高炉低硫贫瘦喷煤", lowSulfurLeanPciTotal, monthStartTime);
 
-        log.info("月度采集完成: 焦炭总和={}, 烟煤(高挥发)总和={}, 无烟煤(低硫)总和={}, 烧结焦炭总和={}, 炼铁焦炭总和={}",
-                cokeTotal, bituminousTotal, anthraciteTotal, sinteredCokeTotal, ironCokeTotal);
+        log.info("月度采集完成: 焦炭总和={}, 烟煤(高挥发)总和={}, 无烟煤(低硫)总和={}, 烧结焦炭总和={}, "
+                        + "炼铁焦炭总和={}, 高炉高挥发喷煤总和={}, 高炉低硫贫瘦喷煤总和={}",
+                cokeTotal, bituminousTotal, anthraciteTotal, sinteredCokeTotal, ironCokeTotal,
+                highVolatilePciTotal, lowSulfurLeanPciTotal);
     }
 
 }

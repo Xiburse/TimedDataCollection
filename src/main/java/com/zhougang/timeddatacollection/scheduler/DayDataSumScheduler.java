@@ -1,6 +1,7 @@
 package com.zhougang.timeddatacollection.scheduler;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.zhougang.timeddatacollection.service.BlastFurnacePciQueryService;
 import com.zhougang.timeddatacollection.service.CokeMaterialQueryService;
 import com.zhougang.timeddatacollection.service.FilterMaterialQueryService;
 import com.zhougang.timeddatacollection.service.IronCokeQueryService;
@@ -24,8 +25,11 @@ import java.util.Map;
  * 焦炭 = 筛选材料查询（materialType=1）netWgt 合计 + 焦炭材料查询 transportWeight 合计；
  * 喷煤 = 筛选材料查询（materialType=2）按"高挥发"/"低硫"分别汇总，存储为"烟煤"/"无烟煤"；
  * 烧结焦炭 = 焦炭材料流转查询（endPos=ST1_LC_RP）transportWeight 合计；
- * 炼铁焦炭 = 焦炭材料流转查询（两组 matCodeList 各查一次）transportWeight 合计之和。
- * 结果分别以 type=焦炭 / 烟煤 / 无烟煤 / 烧结焦炭 / 炼铁焦炭 写入 jm_day 表，已存在的数据会被覆盖
+ * 炼铁焦炭 = 焦炭材料流转查询（两组 matCodeList 各查一次）transportWeight 合计之和；
+ * 高炉高挥发喷煤 = 焦炭材料流转查询（终点 BF1_LC_PM1~PM5，matCode=1220000008）transportWeight 合计；
+ * 高炉低硫贫瘦喷煤 = 同一接口（matCode=1220000015）transportWeight 合计，与前者分别独立入库。
+ * 结果分别以 type=焦炭 / 烟煤 / 无烟煤 / 烧结焦炭 / 炼铁焦炭 / 高炉高挥发喷煤 / 高炉低硫贫瘦喷煤
+ * 写入 jm_day 表，已存在的数据会被覆盖
  */
 @Component
 public class DayDataSumScheduler {
@@ -40,6 +44,7 @@ public class DayDataSumScheduler {
     private final CokeMaterialQueryService cokeMaterialQueryService;
     private final SinteredCokeQueryService sinteredCokeQueryService;
     private final IronCokeQueryService ironCokeQueryService;
+    private final BlastFurnacePciQueryService blastFurnacePciQueryService;
     private final JmStorageService jmStorageService;
     private final CollectRateLimiter rateLimiter;
 
@@ -47,12 +52,14 @@ public class DayDataSumScheduler {
                                CokeMaterialQueryService cokeMaterialQueryService,
                                SinteredCokeQueryService sinteredCokeQueryService,
                                IronCokeQueryService ironCokeQueryService,
+                               BlastFurnacePciQueryService blastFurnacePciQueryService,
                                JmStorageService jmStorageService,
                                CollectRateLimiter rateLimiter) {
         this.filterMaterialQueryService = filterMaterialQueryService;
         this.cokeMaterialQueryService = cokeMaterialQueryService;
         this.sinteredCokeQueryService = sinteredCokeQueryService;
         this.ironCokeQueryService = ironCokeQueryService;
+        this.blastFurnacePciQueryService = blastFurnacePciQueryService;
         this.jmStorageService = jmStorageService;
         this.rateLimiter = rateLimiter;
     }
@@ -120,8 +127,16 @@ public class DayDataSumScheduler {
         double ironCoke = ironCokeQueryService.queryTotalWeight(startTime, endTime);
         jmStorageService.storeDay("炼铁焦炭", ironCoke, startTime);
 
-        log.info("日度采集完成: 焦炭总和={}, 喷煤明细={}, 烧结焦炭={}, 炼铁焦炭={}",
-                cokeTotal, pciFilterMap, sinteredCoke, ironCoke);
+        // 高炉高挥发喷煤：焦炭材料流转查询（终点 BF1_LC_PM1~PM5，matCode=1220000008）
+        double highVolatilePci = blastFurnacePciQueryService.queryHighVolatileWeight(startTime, endTime);
+        jmStorageService.storeDay("高炉高挥发喷煤", highVolatilePci, startTime);
+
+        // 高炉低硫贫瘦喷煤：同一接口，matCode=1220000015，与高挥发喷煤分别独立入库
+        double lowSulfurLeanPci = blastFurnacePciQueryService.queryLowSulfurLeanWeight(startTime, endTime);
+        jmStorageService.storeDay("高炉低硫贫瘦喷煤", lowSulfurLeanPci, startTime);
+
+        log.info("日度采集完成: 焦炭总和={}, 喷煤明细={}, 烧结焦炭={}, 炼铁焦炭={}, 高炉高挥发喷煤={}, 高炉低硫贫瘦喷煤={}",
+                cokeTotal, pciFilterMap, sinteredCoke, ironCoke, highVolatilePci, lowSulfurLeanPci);
     }
 
 }
